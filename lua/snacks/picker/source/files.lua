@@ -2,6 +2,150 @@ local M = {}
 
 local uv = vim.uv or vim.loop
 
+---@type table<snacks.Picker, table<string, {pending?: boolean, status?: table<string, string>}>>
+local picker_git_status = setmetatable({}, { __mode = "k" })
+
+---@param root string
+---@param path string
+local function git_path(root, path)
+  return svim.fs.normalize(vim.fs.joinpath(root, path), { _fast = true, expand_env = false })
+end
+
+---@param root string
+---@param output string
+---@return table<string, string>
+local function parse_git_status(root, output)
+  local status = {}
+  local entries = vim.split(output, "\0", { trimempty = true })
+  local i = 1
+  while i <= #entries do
+    local xy, file = entries[i]:match("^(..) (.*)$")
+    if xy and file then
+      status[git_path(root, file)] = xy
+      if xy:find("[RC]") then
+        local renamed = entries[i + 1]
+        if renamed then
+          status[git_path(root, renamed)] = xy
+          i = i + 1
+        end
+      end
+    end
+    i = i + 1
+  end
+  return status
+end
+
+---@param cwd string?
+---@param picker snacks.Picker
+---@return table<string, string>?
+function M.request_git_status(cwd, picker)
+  if not cwd then
+    return
+  end
+
+  local root = Snacks.git.get_root(cwd)
+  if not root then
+    return
+  end
+
+  picker_git_status[picker] = picker_git_status[picker] or {}
+  local states = picker_git_status[picker]
+  local state = states[root] or {}
+  states[root] = state
+  if state.status then
+    return state.status
+  end
+  if state.pending then
+    return
+  end
+
+  state.pending = true
+  local stdout = assert(uv.new_pipe())
+  local output = {}
+  local exit_code ---@type number?
+  local eof = false
+  local handle ---@type uv.uv_process_t?
+
+  local function finish()
+    if exit_code == nil or not eof then
+      return
+    end
+    local status = exit_code == 0 and parse_git_status(root, table.concat(output)) or {}
+    vim.schedule(function()
+      state.pending = false
+      state.status = status
+      if not picker.closed then
+        picker.list:update({ force = true })
+      end
+    end)
+  end
+
+  ---@diagnostic disable-next-line: missing-fields
+  handle = uv.spawn("git", {
+    args = {
+      "-c",
+      "core.quotepath=false",
+      "--no-pager",
+      "--no-optional-locks",
+      "status",
+      "--porcelain=v1",
+      "-uall",
+      "--ignored=matching",
+      "-z",
+    },
+    cwd = root,
+    stdio = { nil, stdout, nil },
+    hide = true,
+  }, function(code)
+    exit_code = code
+    if handle then
+      handle:close()
+    end
+    finish()
+  end)
+
+  if not handle then
+    stdout:close()
+    state.pending = false
+    state.status = {}
+    return
+  end
+
+  stdout:read_start(function(err, data)
+    assert(not err, err)
+    if data then
+      output[#output + 1] = data
+    else
+      eof = true
+      stdout:close()
+      finish()
+    end
+  end)
+  return
+end
+
+---@param item snacks.picker.Item
+---@param picker snacks.Picker
+---@return string?
+function M.git_status(item, picker)
+  local path = Snacks.picker.util.path(item)
+  if not path then
+    return
+  end
+
+  local root = Snacks.git.get_root(path)
+  local status = M.request_git_status(root, picker)
+  return status and status[svim.fs.normalize(path, { _fast = true, expand_env = false })]
+end
+
+---@param picker snacks.Picker
+local function filename_first(picker)
+  local file = picker.opts.formatters and picker.opts.formatters.file
+  return (picker.opts.source == "files" or picker.opts.source == "smart")
+    and file ~= nil
+    and file.filename_first == true
+end
+
 ---@type {cmd:string[], args:string[], enabled?:boolean, available?:boolean|string}[]
 local commands = {
   {
@@ -156,6 +300,9 @@ function M.files(opts, ctx)
   local cwd = not (opts.rtp or (opts.dirs and #opts.dirs > 0))
       and svim.fs.normalize(opts and opts.cwd or uv.cwd() or ".")
     or nil
+  if filename_first(ctx.picker) then
+    M.request_git_status(cwd or ctx:cwd(), ctx.picker)
+  end
   local cmd, args = get_cmd(opts, ctx.filter)
   if not cmd then
     return function() end
