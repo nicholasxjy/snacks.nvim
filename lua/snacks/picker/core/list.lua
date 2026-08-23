@@ -613,6 +613,9 @@ function M:render()
       for _, item in ipairs(self.items) do
         width = math.max(width, item_filename_width(item))
       end
+      for _, item in ipairs(self.topk:get()) do
+        width = math.max(width, item_filename_width(item))
+      end
       self.filename_width = width
     end
 

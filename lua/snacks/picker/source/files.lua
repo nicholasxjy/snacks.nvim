@@ -2,13 +2,15 @@ local M = {}
 
 local uv = vim.uv or vim.loop
 
----@type table<snacks.Picker, table<string, {pending?: boolean, status?: table<string, string>}>>
+---@type table<snacks.Picker, table<string, {pending?: boolean, status?: table<string, string>, aborted?: boolean, handle?: any, stdout?: any}>>
 local picker_git_status = setmetatable({}, { __mode = "k" })
+---@type table<snacks.Picker, boolean>
+local picker_git_status_close = setmetatable({}, { __mode = "k" })
 
 ---@param root string
 ---@param path string
 local function git_path(root, path)
-  return svim.fs.normalize(vim.fs.joinpath(root, path), { _fast = true, expand_env = false })
+  return svim.fs.normalize(root .. "/" .. path, { _fast = true, expand_env = false })
 end
 
 ---@param root string
@@ -22,7 +24,7 @@ local function parse_git_status(root, output)
     local xy, file = entries[i]:match("^(..) (.*)$")
     if xy and file then
       status[git_path(root, file)] = xy
-      if xy:find("[RC]") then
+      if xy:find("R") then
         local renamed = entries[i + 1]
         if renamed then
           status[git_path(root, renamed)] = xy
@@ -33,6 +35,20 @@ local function parse_git_status(root, output)
     i = i + 1
   end
   return status
+end
+
+---@param state table
+local function abort_git_status(state)
+  state.aborted = true
+  state.pending = false
+  state.status = {}
+  if state.stdout and not state.stdout:is_closing() then
+    state.stdout:read_stop()
+    state.stdout:close()
+  end
+  if state.handle and not state.handle:is_closing() then
+    state.handle:kill("sigterm")
+  end
 end
 
 ---@param cwd string?
@@ -50,6 +66,23 @@ function M.request_git_status(cwd, picker)
 
   picker_git_status[picker] = picker_git_status[picker] or {}
   local states = picker_git_status[picker]
+
+  if not picker_git_status_close[picker] then
+    picker_git_status_close[picker] = true
+    local on_close = picker.opts.on_close
+    picker.opts.on_close = function(closed_picker)
+      local close_states = picker_git_status[closed_picker]
+      if close_states then
+        for _, close_state in pairs(close_states) do
+          abort_git_status(close_state)
+        end
+      end
+      if on_close then
+        on_close(closed_picker)
+      end
+    end
+  end
+
   local state = states[root] or {}
   states[root] = state
   if state.status then
@@ -64,14 +97,20 @@ function M.request_git_status(cwd, picker)
   local output = {}
   local exit_code ---@type number?
   local eof = false
-  local handle ---@type uv.uv_process_t?
+  local read_error = false
+  local finished = false
+  local handle ---@type uv.uv_process_t
 
   local function finish()
-    if exit_code == nil or not eof then
+    if finished or state.aborted or (not read_error and (exit_code == nil or not eof)) then
       return
     end
+    finished = true
     local status = exit_code == 0 and parse_git_status(root, table.concat(output)) or {}
     vim.schedule(function()
+      if state.aborted then
+        return
+      end
       state.pending = false
       state.status = status
       if not picker.closed then
@@ -98,6 +137,7 @@ function M.request_git_status(cwd, picker)
     hide = true,
   }, function(code)
     exit_code = code
+    state.handle = nil
     if handle then
       handle:close()
     end
@@ -110,14 +150,29 @@ function M.request_git_status(cwd, picker)
     state.status = {}
     return
   end
+  state.handle = handle
+  state.stdout = stdout
 
   stdout:read_start(function(err, data)
-    assert(not err, err)
+    if state.aborted or read_error then
+      return
+    end
+    if err then
+      read_error = true
+      eof = true
+      if handle and not handle:is_closing() then
+        handle:kill("sigterm")
+      end
+      stdout:close()
+      finish()
+      return
+    end
     if data then
       output[#output + 1] = data
     else
       eof = true
       stdout:close()
+      state.stdout = nil
       finish()
     end
   end)
@@ -134,8 +189,30 @@ function M.git_status(item, picker)
   end
 
   local root = Snacks.git.get_root(path)
-  local status = M.request_git_status(root, picker)
-  return status and status[svim.fs.normalize(path, { _fast = true, expand_env = false })]
+  local statuses = M.request_git_status(root, picker)
+  if not statuses then
+    return
+  end
+
+  path = svim.fs.normalize(path, { _fast = true, expand_env = false })
+  if statuses[path] then
+    return statuses[path]
+  end
+
+  local parent = svim.fs.normalize(vim.fn.fnamemodify(path, ":h"), { _fast = true, expand_env = false })
+  while parent and parent ~= path do
+    if statuses[parent] == "!!" then
+      return "!!"
+    end
+    if parent == root then
+      break
+    end
+    local next_parent = svim.fs.normalize(vim.fn.fnamemodify(parent, ":h"), { _fast = true, expand_env = false })
+    if next_parent == parent then
+      break
+    end
+    parent = next_parent
+  end
 end
 
 ---@param picker snacks.Picker

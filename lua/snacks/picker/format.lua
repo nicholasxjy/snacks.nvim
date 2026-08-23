@@ -113,7 +113,11 @@ function M.filename(item, picker)
         if base and dir then
           if picker.opts.formatters.file.filename_first then
             resolved[#resolved + 1] = { base, base_hl, field = "file" }
-            if M.filename_first(picker) and picker.list.filename_width then
+            if
+              M.filename_first(picker)
+              and picker.list.filename_width
+              and base == vim.fn.fnamemodify(path, ":t")
+            then
               local padding = picker.list.filename_width - vim.api.nvim_strwidth(base)
               if padding > 0 then
                 resolved[#resolved + 1] = { string.rep(" ", padding) }

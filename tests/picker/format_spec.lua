@@ -51,6 +51,14 @@ describe("file format", function()
     )
   end)
 
+  it("does not pad a truncated filename to its raw width", function()
+    local p = picker("files", true, 100)
+    local filename = string.rep("x", 100) .. ".lua"
+    local value = text({ file = "/tmp/source/" .. filename }, p)
+
+    assert.is_true(vim.api.nvim_strwidth(value) < 100)
+  end)
+
   it("shows git status before the file icon", function()
     local p = picker("smart", true, 0)
     local line = Format.file({ file = "/tmp/a.lua", status = " M" }, p)
