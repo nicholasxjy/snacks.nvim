@@ -4,6 +4,15 @@ local M = {}
 
 local uv = vim.uv or vim.loop
 
+---@param picker snacks.Picker
+---@return boolean
+function M.filename_first(picker)
+  local file = picker.opts.formatters and picker.opts.formatters.file
+  return (picker.opts.source == "files" or picker.opts.source == "smart")
+    and file ~= nil
+    and file.filename_first == true
+end
+
 function M.severity(item, picker)
   local ret = {} ---@type snacks.picker.Highlight[]
   local severity = item.severity
@@ -104,6 +113,16 @@ function M.filename(item, picker)
         if base and dir then
           if picker.opts.formatters.file.filename_first then
             resolved[#resolved + 1] = { base, base_hl, field = "file" }
+            if
+              M.filename_first(picker)
+              and picker.list.filename_width
+              and base == vim.fn.fnamemodify(path, ":t")
+            then
+              local padding = picker.list.filename_width - vim.api.nvim_strwidth(base)
+              if padding > 0 then
+                resolved[#resolved + 1] = { string.rep(" ", padding) }
+              end
+            end
             resolved[#resolved + 1] = { " " }
             resolved[#resolved + 1] = { dir, dir_hl, field = "file" }
           else
@@ -153,7 +172,10 @@ function M.file(item, picker)
     vim.list_extend(ret, M.tree(item, picker))
   end
 
-  if item.status then
+  if M.filename_first(picker) then
+    local status = item.status or require("snacks.picker.source.files").git_status(item, picker)
+    vim.list_extend(ret, M.file_git_status(item, picker, status))
+  elseif item.status then
     vim.list_extend(ret, M.file_git_status(item, picker))
   end
 
@@ -596,9 +618,17 @@ function M.git_status(item, picker)
   return ret
 end
 
-function M.file_git_status(item, picker)
+function M.file_git_status(item, picker, status)
   local ret = {} ---@type snacks.picker.Highlight[]
-  local status = require("snacks.picker.source.git").git_status(item.status)
+  status = status or item.status
+  if not status then
+    if M.filename_first(picker) then
+      ret[#ret + 1] = { "  ", virtual = true }
+      ret[#ret + 1] = { " ", virtual = true }
+    end
+    return ret
+  end
+  status = require("snacks.picker.source.git").git_status(status)
 
   local hl = "SnacksPickerGitStatus"
   if status.unmerged then
@@ -622,12 +652,17 @@ function M.file_git_status(item, picker)
     end
   end
 
-  ret[#ret + 1] = {
-    col = 0,
-    virt_text = { { icon, hl }, { " " } },
-    virt_text_pos = "right_align",
-    hl_mode = "combine",
-  }
+  if M.filename_first(picker) then
+    ret[#ret + 1] = { Snacks.picker.util.align(icon, 2, { align = "right" }), hl, virtual = true }
+    ret[#ret + 1] = { " ", virtual = true }
+  else
+    ret[#ret + 1] = {
+      col = 0,
+      virt_text = { { icon, hl }, { " " } },
+      virt_text_pos = "right_align",
+      hl_mode = "combine",
+    }
+  end
   return ret
 end
 

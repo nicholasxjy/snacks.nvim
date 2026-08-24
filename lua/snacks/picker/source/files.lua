@@ -2,6 +2,227 @@ local M = {}
 
 local uv = vim.uv or vim.loop
 
+---@type table<snacks.Picker, table<string, {pending?: boolean, status?: table<string, string>, aborted?: boolean, handle?: any, stdout?: any}>>
+local picker_git_status = setmetatable({}, { __mode = "k" })
+---@type table<snacks.Picker, boolean>
+local picker_git_status_close = setmetatable({}, { __mode = "k" })
+
+---@param root string
+---@param path string
+local function git_path(root, path)
+  return svim.fs.normalize(root .. "/" .. path, { _fast = true, expand_env = false })
+end
+
+---@param root string
+---@param output string
+---@return table<string, string>
+local function parse_git_status(root, output)
+  local status = {}
+  local entries = vim.split(output, "\0", { trimempty = true })
+  local i = 1
+  while i <= #entries do
+    local xy, file = entries[i]:match("^(..) (.*)$")
+    if xy and file then
+      status[git_path(root, file)] = xy
+      if xy:find("R") then
+        local renamed = entries[i + 1]
+        if renamed then
+          status[git_path(root, renamed)] = xy
+          i = i + 1
+        end
+      end
+    end
+    i = i + 1
+  end
+  return status
+end
+
+---@param state table
+local function abort_git_status(state)
+  state.aborted = true
+  state.pending = false
+  state.status = {}
+  if state.stdout and not state.stdout:is_closing() then
+    state.stdout:read_stop()
+    state.stdout:close()
+  end
+  if state.handle and not state.handle:is_closing() then
+    state.handle:kill("sigterm")
+  end
+end
+
+---@param cwd string?
+---@param picker snacks.Picker
+---@return table<string, string>?
+function M.request_git_status(cwd, picker)
+  if not cwd then
+    return
+  end
+
+  local root = Snacks.git.get_root(cwd)
+  if not root then
+    return
+  end
+
+  picker_git_status[picker] = picker_git_status[picker] or {}
+  local states = picker_git_status[picker]
+
+  if not picker_git_status_close[picker] then
+    picker_git_status_close[picker] = true
+    local on_close = picker.opts.on_close
+    picker.opts.on_close = function(closed_picker)
+      local close_states = picker_git_status[closed_picker]
+      if close_states then
+        for _, close_state in pairs(close_states) do
+          abort_git_status(close_state)
+        end
+      end
+      if on_close then
+        on_close(closed_picker)
+      end
+    end
+  end
+
+  local state = states[root] or {}
+  states[root] = state
+  if state.status then
+    return state.status
+  end
+  if state.pending then
+    return
+  end
+
+  state.pending = true
+  local stdout = assert(uv.new_pipe())
+  local output = {}
+  local exit_code ---@type number?
+  local eof = false
+  local read_error = false
+  local finished = false
+  local handle ---@type uv.uv_process_t
+
+  local function finish()
+    if finished or state.aborted or (not read_error and (exit_code == nil or not eof)) then
+      return
+    end
+    finished = true
+    local status = exit_code == 0 and parse_git_status(root, table.concat(output)) or {}
+    vim.schedule(function()
+      if state.aborted then
+        return
+      end
+      state.pending = false
+      state.status = status
+      if not picker.closed then
+        picker.list:update({ force = true })
+      end
+    end)
+  end
+
+  ---@diagnostic disable-next-line: missing-fields
+  handle = uv.spawn("git", {
+    args = {
+      "-c",
+      "core.quotepath=false",
+      "--no-pager",
+      "--no-optional-locks",
+      "status",
+      "--porcelain=v1",
+      "-uall",
+      "--ignored=matching",
+      "-z",
+    },
+    cwd = root,
+    stdio = { nil, stdout, nil },
+    hide = true,
+  }, function(code)
+    exit_code = code
+    state.handle = nil
+    if handle then
+      handle:close()
+    end
+    finish()
+  end)
+
+  if not handle then
+    stdout:close()
+    state.pending = false
+    state.status = {}
+    return
+  end
+  state.handle = handle
+  state.stdout = stdout
+
+  stdout:read_start(function(err, data)
+    if state.aborted or read_error then
+      return
+    end
+    if err then
+      read_error = true
+      eof = true
+      if handle and not handle:is_closing() then
+        handle:kill("sigterm")
+      end
+      stdout:close()
+      finish()
+      return
+    end
+    if data then
+      output[#output + 1] = data
+    else
+      eof = true
+      stdout:close()
+      state.stdout = nil
+      finish()
+    end
+  end)
+  return
+end
+
+---@param item snacks.picker.Item
+---@param picker snacks.Picker
+---@return string?
+function M.git_status(item, picker)
+  local path = Snacks.picker.util.path(item)
+  if not path then
+    return
+  end
+
+  local root = Snacks.git.get_root(path)
+  local statuses = M.request_git_status(root, picker)
+  if not statuses then
+    return
+  end
+
+  path = svim.fs.normalize(path, { _fast = true, expand_env = false })
+  if statuses[path] then
+    return statuses[path]
+  end
+
+  local parent = svim.fs.normalize(vim.fn.fnamemodify(path, ":h"), { _fast = true, expand_env = false })
+  while parent and parent ~= path do
+    if statuses[parent] == "!!" then
+      return "!!"
+    end
+    if parent == root then
+      break
+    end
+    local next_parent = svim.fs.normalize(vim.fn.fnamemodify(parent, ":h"), { _fast = true, expand_env = false })
+    if next_parent == parent then
+      break
+    end
+    parent = next_parent
+  end
+end
+
+---@param picker snacks.Picker
+local function filename_first(picker)
+  local file = picker.opts.formatters and picker.opts.formatters.file
+  return (picker.opts.source == "files" or picker.opts.source == "smart")
+    and file ~= nil
+    and file.filename_first == true
+end
+
 ---@type {cmd:string[], args:string[], enabled?:boolean, available?:boolean|string}[]
 local commands = {
   {
@@ -156,6 +377,9 @@ function M.files(opts, ctx)
   local cwd = not (opts.rtp or (opts.dirs and #opts.dirs > 0))
       and svim.fs.normalize(opts and opts.cwd or uv.cwd() or ".")
     or nil
+  if filename_first(ctx.picker) then
+    M.request_git_status(cwd or ctx:cwd(), ctx.picker)
+  end
   local cmd, args = get_cmd(opts, ctx.filter)
   if not cmd then
     return function() end

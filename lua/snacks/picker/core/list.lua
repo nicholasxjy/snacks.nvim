@@ -8,6 +8,7 @@
 ---@field state snacks.picker.list.State
 ---@field paused boolean
 ---@field topk snacks.picker.MinHeap
+---@field filename_width? number
 ---@field _current? snacks.picker.Item
 ---@field did_preview? boolean
 ---@field reverse? boolean
@@ -30,6 +31,16 @@ local ns = vim.api.nvim_create_namespace("snacks.picker.list")
 
 local function minmax(value, min, max)
   return math.max(min, math.min(value, max))
+end
+
+---@param item snacks.picker.Item
+---@return number
+local function item_filename_width(item)
+  if not item.file then
+    return 0
+  end
+  local path = Snacks.picker.util.path(item) or item.file
+  return vim.api.nvim_strwidth(vim.fn.fnamemodify(path, ":t"))
 end
 
 local SCROLL_WHEEL_UP = Snacks.util.keycode("<ScrollWheelUp>")
@@ -92,6 +103,7 @@ function M.new(picker)
   self.win = Snacks.win(win_opts)
   self.top, self.cursor = 1, 1
   self.items = {}
+  self.filename_width = nil
   self.state = { height = 0, scrolloff = 0, scroll = 0, mousescroll = 1 }
   self.dirty = true
   self.topk = require("snacks.picker.util.minheap").new({
@@ -302,6 +314,7 @@ function M:clear()
   self.topk:clear()
   self.top, self.cursor = 1, 1
   self.items = {}
+  self.filename_width = nil
   self.dirty = true
   if next(self.items) == nil then
     return
@@ -321,6 +334,9 @@ end
 function M:add(item, sort)
   local idx = #self.items + 1
   self.items[idx] = item
+  if Snacks.picker.format.filename_first(self.picker) then
+    self.dirty = true
+  end
   -- if the visible items are less than the height, then we need to render
   self.dirty = self.dirty or #self.visible < (self.state.height or 50)
   if sort ~= false then
@@ -585,6 +601,18 @@ function M:render()
     local search = Snacks.picker.util.parse(vim.trim(self.picker.input.filter.search))
     if self.matcher_regex.pattern ~= search then
       self.matcher_regex:init(search)
+    end
+
+    self.filename_width = nil
+    if Snacks.picker.format.filename_first(self.picker) then
+      local width = 0
+      for _, item in ipairs(self.items) do
+        width = math.max(width, item_filename_width(item))
+      end
+      for _, item in ipairs(self.topk:get()) do
+        width = math.max(width, item_filename_width(item))
+      end
+      self.filename_width = width
     end
 
     self.visible = {}
