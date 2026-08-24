@@ -1,6 +1,7 @@
 ---@module 'luassert'
 
 local Format = require("snacks.picker.format")
+local List = require("snacks.picker.core.list")
 local defaults = require("snacks.picker.config.defaults").defaults
 
 ---@param source string
@@ -57,6 +58,23 @@ describe("file format", function()
     local value = text({ file = "/tmp/source/" .. filename }, p)
 
     assert.is_true(vim.api.nvim_strwidth(value) < 100)
+  end)
+
+  it("does not measure filename width while adding items", function()
+    local original = vim.api.nvim_strwidth
+    vim.api.nvim_strwidth = function()
+      error("filename width must be measured during render")
+    end
+    local ok, err = pcall(List.add, {
+      items = {},
+      picker = picker("files", true, 0),
+      visible = {},
+      state = { height = 0 },
+      dirty = false,
+    }, { file = "/tmp/a.lua" }, false)
+    vim.api.nvim_strwidth = original
+
+    assert.is_true(ok, err)
   end)
 
   it("shows git status before the file icon", function()

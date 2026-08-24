@@ -335,11 +335,7 @@ function M:add(item, sort)
   local idx = #self.items + 1
   self.items[idx] = item
   if Snacks.picker.format.filename_first(self.picker) then
-    local width = item_filename_width(item)
-    if width > (self.filename_width or 0) then
-      self.filename_width = width
-      self.dirty = true
-    end
+    self.dirty = true
   end
   -- if the visible items are less than the height, then we need to render
   self.dirty = self.dirty or #self.visible < (self.state.height or 50)
